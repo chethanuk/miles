@@ -1916,7 +1916,11 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 "--use-dynamic-global-batch-size",
                 action="store_true",
                 default=False,
-                help="enable dynamic global batch size, disable trim samples in rollout buffer when converting samples to train data",
+                help=(
+                    "Resize the global batch to the number of samples actually collected (rounded down to a "
+                    "multiple of dp_size), forcing exactly one optimizer step per rollout. Useful in async modes "
+                    "where the collected count varies. Incompatible with --disable-rollout-trim-samples."
+                ),
             )
             return parser
 
@@ -2260,6 +2264,44 @@ def _resolve_ft_components(args: argparse.Namespace) -> list[str]:
     if args.ft_components is None:
         return list(_FT_DEFAULT_COMPONENTS)
     return list(args.ft_components)
+
+
+def _validate_async_batch_semantics(args) -> None:
+    """Guard the num_steps_per_rollout / use_dynamic_global_batch_size / max_weight_staleness
+    interaction. `max_weight_staleness is not None` is the proxy for fully-async: it is the only
+    in-tree signal (nothing under `miles/` references fully-async) and its help scopes it to that
+    mode. See docs/user-guide/fully-async.md."""
+    assert not (args.use_dynamic_global_batch_size and args.disable_rollout_trim_samples), (
+        "--use-dynamic-global-batch-size is incompatible with --disable-rollout-trim-samples: the "
+        "dynamic batch size is only computed on the trimming path (rollout_data_conversion.py), so "
+        "with trimming disabled it is never set and training dies later on an opaque assert in "
+        "train_data_conversion.py. Drop one of the two flags."
+    )
+    if args.max_weight_staleness is None:
+        return
+    if args.use_dynamic_global_batch_size:
+        logger.info(
+            "--use-dynamic-global-batch-size resizes the global batch to the collected sample count, "
+            "so each drain takes exactly one optimizer step per drain and no intra-drain policy drift "
+            "accumulates. This is a different gap from --max-weight-staleness, which bounds the "
+            "rollout-vs-trainer weight-version lag; both remain in effect."
+        )
+        return
+    if not args.global_batch_size:
+        return
+    steps = args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
+    if steps > 1:
+        logger.warning(
+            f"num_steps_per_rollout={steps} (rollout_batch_size {args.rollout_batch_size} * "
+            f"n_samples_per_prompt {args.n_samples_per_prompt} // global_batch_size "
+            f"{args.global_batch_size}) with --max-weight-staleness={args.max_weight_staleness}. "
+            "Each drain takes multiple optimizer steps against log-probs snapshotted once at drain "
+            "start, so step k trains a policy k-1 steps past that snapshot. In fully-async this "
+            "off-policyness composes with the rollout-vs-trainer gap that --max-weight-staleness "
+            "bounds; the two are corrected by separately clipped ratios. Watch ppo_kl / clip-frac "
+            "and tis / tis_clipfrac. Set --num-steps-per-rollout 1 (or --use-dynamic-global-batch-size) "
+            "for one step per drain. See docs/user-guide/fully-async.md."
+        )
 
 
 def miles_validate_args(args):
@@ -2669,6 +2711,8 @@ def miles_validate_args(args):
                 f"// num_steps_per_rollout {args.num_steps_per_rollout}"
             )
         args.global_batch_size = global_batch_size
+
+    _validate_async_batch_semantics(args)
 
     if args.n_samples_per_prompt == 1:
         args.grpo_std_normalization = False
