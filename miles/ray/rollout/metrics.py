@@ -228,28 +228,35 @@ def _compute_reward_cat_metrics(args, all_samples: list[Sample]):
 
 
 def _compute_passrate_from_samples(args, all_samples: list[Sample]) -> dict[str, float]:
-    """Compute pass@k metrics from samples using group_index for correct grouping.
+    """Compute pass@k metrics from samples using group_index for grouping.
 
-    Unlike the trainer-side log_passrate (which assumed a flat reward array with
-    contiguous groups of n_samples_per_prompt), this groups samples by their
-    group_index field and computes pass@k over complete groups only. This is
-    robust to filtering that may remove individual samples from a group —
-    incomplete groups are excluded from the estimate rather than skewing it
-    or crashing the reshape.
-
-    Called on the rollout side (before convert_samples_to_train_data), so
-    normally all samples are present and every group is complete.
+    Groups samples by group_index, collapses each group to one sample per logical
+    rollout (since compaction/subagent/fork rollouts fan out into multiple sibling
+    rows sharing a rollout_id), and computes pass@k over groups with exactly
+    n_samples_per_prompt rollouts.
     """
     group_size = args.n_samples_per_prompt
     if group_size <= 1:
         return {}
 
     groups = group_by(all_samples, lambda s: s.group_index)
-    completed_groups = [g for g in groups.values() if len(g) == group_size]
+    completed_groups = []
+    for group in groups.values():
+        rollouts: dict[Any, Sample] = {}
+        for position, sample in enumerate(group):
+            if sample.rollout_id is not None:
+                key = sample.rollout_id
+            elif sample.index is not None:
+                key = sample.index
+            else:
+                key = ("row", position)
+            rollouts.setdefault(key, sample)
+        if len(rollouts) == group_size:
+            completed_groups.append(list(rollouts.values()))
     if len(completed_groups) < len(groups):
         logger.warning(
-            f"pass@k: excluding {len(groups) - len(completed_groups)}/{len(groups)} incomplete "
-            f"groups (fewer than n_samples_per_prompt={group_size} samples)."
+            f"pass@k: excluding {len(groups) - len(completed_groups)}/{len(groups)} groups whose "
+            f"rollout count differs from n_samples_per_prompt={group_size}."
         )
     if not completed_groups:
         return {}

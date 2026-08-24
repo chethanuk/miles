@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pytest
-from tests.fast.ray.rollout.conftest import make_args, make_samples_grouped
+from tests.fast.ray.rollout.conftest import make_args, make_sample, make_samples_grouped
 
 from miles.ray.rollout.metrics import (
     _compute_metrics_from_samples,
@@ -9,6 +9,7 @@ from miles.ray.rollout.metrics import (
     _compute_zero_std_metrics,
     log_rollout_data,
 )
+import logging
 
 
 class TestComputeZeroStdMetrics:
@@ -197,3 +198,57 @@ class TestComputePassrateFromSamples:
             "pass@2": pytest.approx(1.0),
             "pass@4": pytest.approx(1.0),
         }
+
+    @pytest.mark.parametrize(
+        "fan",
+        [
+            pytest.param([1, 1, 1, 1], id="no_fan_out"),
+            pytest.param([2, 2, 2, 2], id="uniform_fan_out"),
+            pytest.param([3, 1, 2, 1], id="ragged_fan_out"),
+        ],
+    )
+    def test_fan_out_counts_rollouts_not_rows(self, fan):
+        args = make_args(n_samples_per_prompt=4, reward_key=None)
+        rewards = [1.0, 1.0, 0.0, 0.0]
+        samples = [
+            make_sample(group_index=g, index=4 * g + i, rollout_id=4 * g + i, reward=r)
+            for g in range(2)
+            for i, (r, copies) in enumerate(zip(rewards, fan))
+            for _ in range(copies)
+        ]
+
+        out = _compute_passrate_from_samples(args, samples)
+
+        assert out["pass@1"] == pytest.approx(0.5)
+        assert out["pass@4"] == pytest.approx(1.0)
+
+    def test_samples_without_rollout_id_are_not_collapsed(self):
+        args = make_args(n_samples_per_prompt=4, reward_key=None)
+        samples = make_samples_grouped(2, 4, rewards=[1.0, 0.0, 0.0, 0.0] * 2)
+
+        out = _compute_passrate_from_samples(args, samples)
+
+        assert out["pass@1"] == pytest.approx(0.25)
+
+    def test_warning_when_group_rollout_count_differs(self, caplog):
+        args = make_args(n_samples_per_prompt=4, reward_key=None)
+        # Group 0: 4 rollouts, each fanned out into 2 rows (8 rows)
+        group0 = [
+            make_sample(group_index=0, index=i, rollout_id=i, reward=1.0)
+            for i in range(4)
+            for _ in range(2)
+        ]
+        # Group 1: 3 rollouts, each fanned out into 2 rows (6 rows - missing 1 rollout)
+        group1 = [
+            make_sample(group_index=1, index=4 + i, rollout_id=4 + i, reward=1.0)
+            for i in range(3)
+            for _ in range(2)
+        ]
+
+        with caplog.at_level(logging.WARNING, logger="miles.ray.rollout.metrics"):
+            out = _compute_passrate_from_samples(args, group0 + group1)
+
+        assert out["pass@1"] == pytest.approx(1.0)
+        assert "1/2" in caplog.text
+        assert "fewer than" not in caplog.text
+
