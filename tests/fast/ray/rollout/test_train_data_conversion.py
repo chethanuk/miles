@@ -333,28 +333,64 @@ class TestPostProcessRewards:
         # mean is 5.0, after centering: -3, -1, 1, 3
         assert abs(sum(processed)) < 1e-5
 
-    def test_grpo_normalizes_unique_rollouts_with_unequal_fanout(self):
+    # Each spec row is (group_index, index, rollout_id, reward); siblings of one
+    # logical rollout repeat the same rollout_id, so the group mean must weight
+    # each rollout once no matter how many trajectories it flattened into.
+    @pytest.mark.parametrize(
+        ("rollout_batch_size", "samples_spec", "expected_raw", "expected_processed"),
+        [
+            pytest.param(
+                2,
+                [
+                    (0, 0, 10, 0.0),
+                    (0, 1, 11, 1.0),
+                    (0, 1, 11, 1.0),
+                    (0, 1, 11, 1.0),
+                    (1, 2, 20, 2.0),
+                    (1, 2, 20, 2.0),
+                    (1, 3, 21, 4.0),
+                ],
+                [0.0, 1.0, 1.0, 1.0, 2.0, 2.0, 4.0],
+                [-0.5, 0.5, 0.5, 0.5, -1.0, -1.0, 1.0],
+                id="unequal_fanout",
+            ),
+            pytest.param(
+                # Issue #2378's literal example: one group, rollout A (reward 1.0)
+                # with two trajectories and rollout B (reward 0.5) with one. The
+                # mean is over [1.0, 0.5] = 0.75, not over the flattened
+                # [1.0, 1.0, 0.5] = 0.8333 the issue reports.
+                1,
+                [(0, 0, 10, 1.0), (0, 0, 10, 1.0), (0, 1, 11, 0.5)],
+                [1.0, 1.0, 0.5],
+                [0.25, 0.25, -0.25],
+                id="issue_2378_example",
+            ),
+        ],
+    )
+    def test_grpo_normalizes_unique_rollouts_with_unequal_fanout(
+        self,
+        rollout_batch_size: int,
+        samples_spec: list[tuple[int, int, int, float]],
+        expected_raw: list[float],
+        expected_processed: list[float],
+    ):
         args = make_args(
             advantage_estimator="grpo",
             rewards_normalization=True,
+            # Gates the std divide; with it on the issue case would be ±1/sqrt(2).
             grpo_std_normalization=False,
             n_samples_per_prompt=2,
-            rollout_batch_size=2,
+            rollout_batch_size=rollout_batch_size,
         )
         samples = [
-            make_sample(group_index=0, index=0, rollout_id=10, reward=0.0),
-            make_sample(group_index=0, index=1, rollout_id=11, reward=1.0),
-            make_sample(group_index=0, index=1, rollout_id=11, reward=1.0),
-            make_sample(group_index=0, index=1, rollout_id=11, reward=1.0),
-            make_sample(group_index=1, index=2, rollout_id=20, reward=2.0),
-            make_sample(group_index=1, index=2, rollout_id=20, reward=2.0),
-            make_sample(group_index=1, index=3, rollout_id=21, reward=4.0),
+            make_sample(group_index=group_index, index=index, rollout_id=rollout_id, reward=reward)
+            for group_index, index, rollout_id, reward in samples_spec
         ]
 
         raw, processed = _post_process_rewards(args, samples, custom_reward_post_process_func=None)
 
-        assert raw == [0.0, 1.0, 1.0, 1.0, 2.0, 2.0, 4.0]
-        assert processed == pytest.approx([-0.5, 0.5, 0.5, 0.5, -1.0, -1.0, 1.0])
+        assert raw == expected_raw
+        assert processed == pytest.approx(expected_processed)
 
     def test_grpo_broadcasts_std_normalized_rollout_advantage(self):
         args = make_args(
